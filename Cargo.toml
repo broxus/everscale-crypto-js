@@ -1,0 +1,40 @@
+[package]
+name = "everscale-crypto"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ivan Kalinin <i.kalinin@dexpa.io>"]
+repository = "https://github.com/broxus/everscale-crypto-js"
+description = "Crypto utils bindings for WASM"
+license-file = "LICENSE"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+lto = true
+panic = "abort"
+incremental = false
+codegen-units = 1
+opt-level = "z"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz", "--enable-mutable-globals"]
+
+[dependencies]
+base64 = "0.13.0"
+getrandom = { version = "0.2", features = ["js"] }
+hex = "0.4"
+hmac = "0.11.0"
+js-sys = "0.3.58"
+pbkdf2 = "0.9.0"
+rand = { version = "0.8", features = ["getrandom"] }
+sha2 = "0.9.9"
+wasm-bindgen = "0.2"
+zeroize = "1.5.6"
+
+ed25519-dalek = { git = "https://github.com/broxus/ed25519-dalek.git" }
+tiny-bip39 = { git = "https://github.com/broxus/tiny-bip39.git", default-features = false, features = [] }
+tiny-hderive = { git = "https://github.com/broxus/tiny-hderive.git" }
+
+[patch.crates-io]
+hmac-drbg = { git = "https://github.com/Rexagon/rust-hmac-drbg" }
