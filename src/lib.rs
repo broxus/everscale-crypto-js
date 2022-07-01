@@ -141,6 +141,16 @@ pub fn sign(secret_key: &str, data: &str) -> Result<String, JsValue> {
     Ok(base64::encode(signature.to_bytes()))
 }
 
+#[wasm_bindgen(js_name = "getPublicKey")]
+pub fn get_public_key(secret_key: &str) -> Result<String, JsValue> {
+    let mut secret_key = parse_hex_or_base64_bytes(secret_key).handle_error()?;
+    let secret = ed25519_dalek::SecretKey::from_bytes(&secret_key).handle_error()?;
+    secret_key.zeroize();
+
+    let public = ed25519_dalek::PublicKey::from(&secret);
+    Ok(hex::encode(public.as_bytes()))
+}
+
 #[wasm_bindgen(js_name = "verifySignature")]
 pub fn verify_signature(public_key: &str, data: &str, signature: &str) -> Result<bool, JsValue> {
     let public_key = parse_public_key(public_key)?;
