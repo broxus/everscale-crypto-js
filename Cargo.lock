@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "everscale-crypto"
-version = "0.1.1"
+version = "0.1.3"
 dependencies = [
  "base64",
  "ed25519-dalek",
