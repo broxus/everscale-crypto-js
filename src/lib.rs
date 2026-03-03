@@ -34,6 +34,11 @@ extern "C" {
 }
 
 const LANGUAGE: bip39::Language = bip39::Language::English;
+const TON_PBKDF_ITERATIONS: u32 = 100_000;
+const TON_BASIC_SEED_SALT: &[u8] = b"TON seed version";
+const TON_FAST_SEED_SALT: &[u8] = b"TON fast seed version";
+const TON_DEFAULT_SEED_SALT: &[u8] = b"TON default seed";
+const TON_HD_SEED_SALT: &[u8] = b"TON HD Keys seed";
 
 #[wasm_bindgen(js_name = "generateLegacyPhrase")]
 pub fn generate_legacy() -> String {
@@ -60,9 +65,6 @@ pub fn generate_legacy() -> String {
 
 #[wasm_bindgen(js_name = "deriveLegacyPhrase")]
 pub fn derive_legacy_phrase(phrase: &str) -> Result<JsKeyPair, JsValue> {
-    const PBKDF_ITERATIONS: u32 = 100_000;
-    const SALT: &[u8] = b"TON default seed";
-
     let phrase = phrase.trim();
 
     let wordmap = LANGUAGE.wordmap();
@@ -85,16 +87,15 @@ pub fn derive_legacy_phrase(phrase: &str) -> Result<JsKeyPair, JsValue> {
         .into_bytes();
 
     let mut res = [0; 512 / 8];
-    pbkdf2::<hmac::Hmac<sha2::Sha512>>(&password, SALT, PBKDF_ITERATIONS, &mut res);
+    pbkdf2::<hmac::Hmac<sha2::Sha512>>(
+        &password,
+        TON_DEFAULT_SEED_SALT,
+        TON_PBKDF_ITERATIONS,
+        &mut res,
+    );
 
-    let secret = ed25519_dalek::SecretKey::from_bytes(&res[0..32]).unwrap();
-    let public = ed25519_dalek::PublicKey::from(&secret);
-
-    Ok(ObjectBuilder::new()
-        .set("secretKey", hex::encode(secret.as_bytes()))
-        .set("publicKey", hex::encode(public.as_bytes()))
-        .build()
-        .unchecked_into())
+    let secret = ed25519_dalek::SecretKey::from_bytes(&res[0..32]).handle_error()?;
+    Ok(build_key_pair(secret))
 }
 
 #[wasm_bindgen(js_name = "generateBip39Phrase")]
@@ -120,6 +121,13 @@ pub fn derive_bip39_phrase(phrase: &str, path: &str) -> Result<JsKeyPair, JsValu
         .set("publicKey", hex::encode(public.as_bytes()))
         .build()
         .unchecked_into())
+}
+
+#[wasm_bindgen(js_name = "deriveTonMnemonic")]
+pub fn derive_ton_mnemonic(phrase: &str, path: Option<String>) -> Result<JsKeyPair, JsValue> {
+    let secret = derive_ton_mnemonic_secret(phrase.trim(), "", path.as_deref().map(str::trim))
+        .handle_error()?;
+    Ok(build_key_pair(secret))
 }
 
 #[wasm_bindgen(js_name = "makeBip39Path")]
@@ -180,6 +188,120 @@ pub fn make_extended_signature(signature: [u8; 64]) -> JsExtendedSignature {
         )
         .build()
         .unchecked_into()
+}
+
+fn build_key_pair(secret: ed25519_dalek::SecretKey) -> JsKeyPair {
+    let public = ed25519_dalek::PublicKey::from(&secret);
+
+    ObjectBuilder::new()
+        .set("secretKey", hex::encode(secret.as_bytes()))
+        .set("publicKey", hex::encode(public.as_bytes()))
+        .build()
+        .unchecked_into()
+}
+
+fn derive_ton_mnemonic_secret(
+    phrase: &str,
+    password: &str,
+    path: Option<&str>,
+) -> Result<ed25519_dalek::SecretKey, String> {
+    let normalized_phrase = normalize_ton_phrase(phrase);
+    validate_ton_mnemonic(&normalized_phrase, password)?;
+
+    let mut entropy = ton_mnemonic_entropy(&normalized_phrase, password);
+    let path = path.filter(|path| !path.is_empty());
+    let result = match path {
+        Some(path) => {
+            let mut seed = ton_mnemonic_seed(&entropy, TON_HD_SEED_SALT, TON_PBKDF_ITERATIONS);
+            let derived = derive_secret_with_path(&seed, path);
+            seed.zeroize();
+            derived
+        }
+        None => {
+            let mut seed = ton_mnemonic_seed(&entropy, TON_DEFAULT_SEED_SALT, TON_PBKDF_ITERATIONS);
+            let secret =
+                ed25519_dalek::SecretKey::from_bytes(&seed[..32]).map_err(|e| e.to_string());
+            seed.zeroize();
+            secret
+        }
+    };
+
+    entropy.zeroize();
+    result
+}
+
+fn derive_secret_with_path(seed: &[u8], path: &str) -> Result<ed25519_dalek::SecretKey, String> {
+    let derived = tiny_hderive::bip32::ExtendedPrivKey::derive(seed, path)
+        .map_err(|_| "Invalid derivation path".to_string())?;
+    ed25519_dalek::SecretKey::from_bytes(&derived.secret()).map_err(|e| e.to_string())
+}
+
+fn normalize_ton_phrase(phrase: &str) -> String {
+    phrase
+        .split_whitespace()
+        .map(|word| word.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn validate_ton_mnemonic(phrase: &str, password: &str) -> Result<(), String> {
+    if phrase.is_empty() {
+        return Err("Expected non-empty phrase".to_string());
+    }
+
+    let wordmap = LANGUAGE.wordmap();
+    for word in phrase.split_whitespace() {
+        if wordmap.get_bits(word).is_err() {
+            return Err("Invalid mnemonic word".to_string());
+        }
+    }
+
+    if !password.is_empty() && !ton_is_password_needed(phrase) {
+        return Err("Unexpected password for this mnemonic".to_string());
+    }
+
+    let mut entropy = ton_mnemonic_entropy(phrase, password);
+    let is_basic_seed = ton_is_basic_seed(&entropy);
+    entropy.zeroize();
+
+    if !is_basic_seed {
+        return Err("invalid checksum".to_string());
+    }
+
+    Ok(())
+}
+
+fn ton_mnemonic_entropy(phrase: &str, password: &str) -> [u8; 64] {
+    let mut mac = hmac::Hmac::<sha2::Sha512>::new_from_slice(phrase.as_bytes()).unwrap();
+    mac.update(password.as_bytes());
+
+    let bytes = mac.finalize().into_bytes();
+    let mut result = [0u8; 64];
+    result.copy_from_slice(bytes.as_slice());
+    result
+}
+
+fn ton_mnemonic_seed(entropy: &[u8], salt: &[u8], iterations: u32) -> [u8; 64] {
+    let mut result = [0u8; 64];
+    pbkdf2::<hmac::Hmac<sha2::Sha512>>(entropy, salt, iterations, &mut result);
+    result
+}
+
+fn ton_is_password_needed(phrase: &str) -> bool {
+    let mut entropy = ton_mnemonic_entropy(phrase, "");
+    let is_password_seed = ton_is_password_seed(&entropy);
+    let is_basic_seed = ton_is_basic_seed(&entropy);
+    entropy.zeroize();
+    is_password_seed && !is_basic_seed
+}
+
+fn ton_is_basic_seed(entropy: &[u8]) -> bool {
+    let iterations = std::cmp::max(1, TON_PBKDF_ITERATIONS / 256);
+    ton_mnemonic_seed(entropy, TON_BASIC_SEED_SALT, iterations)[0] == 0
+}
+
+fn ton_is_password_seed(entropy: &[u8]) -> bool {
+    ton_mnemonic_seed(entropy, TON_FAST_SEED_SALT, 1)[0] == 1
 }
 
 fn parse_signature(signature: &str) -> Result<ed25519_dalek::Signature, JsValue> {
@@ -266,5 +388,28 @@ impl Default for ObjectBuilder {
     #[inline(always)]
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derives_ton_mnemonic_from_reference_vector() {
+        let phrase = "hospital stove relief fringe tongue always charge angry urge \
+                      sentence again match nerve inquiry senior coconut label tumble \
+                      carry category beauty bean road solution";
+        let secret = derive_ton_mnemonic_secret(phrase, "", None).expect("must derive");
+        let public = ed25519_dalek::PublicKey::from(&secret);
+
+        assert_eq!(
+            hex::encode(secret.as_bytes()),
+            "9d659a6c2234db7f6e4f977e6e8653b9f5946d557163f31034011375d8f3f97d"
+        );
+        assert_eq!(
+            hex::encode(public.as_bytes()),
+            "f6c450a16bb1c514e22f1977e390a3025599aa1e7b00068a6aacf2119484c1bd"
+        );
     }
 }
